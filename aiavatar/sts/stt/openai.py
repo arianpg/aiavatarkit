@@ -11,6 +11,7 @@ class OpenAISpeechRecognizer(SpeechRecognizer):
     def __init__(
         self,
         openai_api_key: str,
+        base_url: str = "https://api.openai.com/v1",
         model: str = "gpt-4o-mini-transcribe",
         min_data_length: int = 4096,
         sample_rate: int = 16000,
@@ -30,6 +31,7 @@ class OpenAISpeechRecognizer(SpeechRecognizer):
             timeout=timeout,
             debug=debug
         )
+        self.base_url = base_url
         self.openai_api_key = openai_api_key
         self.model = model
         self.min_data_length = min_data_length
@@ -73,7 +75,7 @@ class OpenAISpeechRecognizer(SpeechRecognizer):
 
         resp = await self.http_request_with_retry(
             method="POST",
-            url="https://api.openai.com/v1/audio/transcriptions",
+            url=f"{self.base_url}/audio/transcriptions",
             headers=headers,
             data=form_data,
             files=files
