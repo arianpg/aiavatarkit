@@ -1,9 +1,11 @@
 import json
+import asyncio
 from logging import getLogger
-from typing import AsyncGenerator, Dict, List, Protocol, Type, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Protocol, Type, Union
 from urllib.parse import urlparse, parse_qs
+import httpx
 import openai as openai_module
-from . import LLMService, LLMResponse, ToolCall, Tool
+from . import LLMService, LLMResponse, ToolCall, Tool, ToolCallResult
 from .context_manager import ContextManager
 
 class OpenAICompatibleModule(Protocol):
@@ -58,6 +60,8 @@ class ChatGPTService(LLMService):
         self.enable_tool_filtering = enable_tool_filtering
         self.extra_body = extra_body
         self._edit_chat_completion_params = None
+        self.openai_api_key = openai_api_key
+        self.base_url = base_url
 
         client_module = custom_openai_module or openai_module
         if "azure" in model:
@@ -288,6 +292,14 @@ class ChatGPTService(LLMService):
         if self.debug:
             logger.info(f"Request to ChatGPT: {chat_completion_params}")
 
+        if self._should_use_hermes_sse_bridge(chat_completion_params):
+            async for llm_response in self._get_hermes_sse_stream_response(
+                context_id=context_id,
+                chat_completion_params=chat_completion_params,
+            ):
+                yield llm_response
+            return
+
         # Send request
         try:
             stream_resp = await self.openai_client.chat.completions.create(**chat_completion_params)
@@ -406,3 +418,225 @@ class ChatGPTService(LLMService):
             finally:
                 # Start deferred background callbacks regardless of errors
                 self._start_deferred_callbacks(tool_calls)
+
+    def _should_use_hermes_sse_bridge(self, chat_completion_params: Dict[str, Any]) -> bool:
+        """Return True for HermesAgent's OpenAI-compatible SSE stream.
+
+        The OpenAI SDK is excellent for normal Chat Completions chunks, but it
+        hides Hermes custom SSE events such as ``hermes.tool.progress``. Agent
+        Stage needs those events to notice avatar-motion tool calls, so Hermes
+        sessions use a small raw-SSE bridge.
+        """
+        extra_headers = chat_completion_params.get("extra_headers") or {}
+        if not isinstance(extra_headers, dict):
+            return False
+        return any(str(key).lower() == "x-hermes-session-id" for key in extra_headers)
+
+    def _chat_completions_url(self) -> str:
+        return (self.base_url or "https://api.openai.com/v1").rstrip("/") + "/chat/completions"
+
+    def _api_origin_url(self) -> str:
+        base = (self.base_url or "").rstrip("/")
+        if base.endswith("/v1"):
+            return base[:-3]
+        return base
+
+    def _hermes_session_id(self, chat_completion_params: Dict[str, Any]) -> Optional[str]:
+        extra_headers = chat_completion_params.get("extra_headers") or {}
+        if not isinstance(extra_headers, dict):
+            return None
+        for key, value in extra_headers.items():
+            if str(key).lower() == "x-hermes-session-id" and value:
+                return str(value)
+        return None
+
+    def _request_headers(self, chat_completion_params: Dict[str, Any]) -> Dict[str, str]:
+        headers = {
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+        }
+        if self.openai_api_key:
+            headers["Authorization"] = f"Bearer {self.openai_api_key}"
+        extra_headers = chat_completion_params.get("extra_headers") or {}
+        if isinstance(extra_headers, dict):
+            headers.update({str(k): str(v) for k, v in extra_headers.items()})
+        return headers
+
+    async def _get_hermes_sse_stream_response(
+        self,
+        *,
+        context_id: str,
+        chat_completion_params: Dict[str, Any],
+    ) -> AsyncGenerator[LLMResponse, None]:
+        payload = {
+            key: value
+            for key, value in chat_completion_params.items()
+            if key not in {"extra_headers", "extra_query", "extra_body"}
+        }
+        if chat_completion_params.get("extra_body"):
+            payload.update(chat_completion_params["extra_body"])
+
+        motion_tool_call_ids = set()
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream(
+                    "POST",
+                    self._chat_completions_url(),
+                    headers=self._request_headers(chat_completion_params),
+                    json=payload,
+                ) as response:
+                    response.raise_for_status()
+                    async for event_name, event_data in self._iter_sse_events(response):
+                        if event_name == "hermes.tool.progress":
+                            tool_event = self._parse_json_object(event_data)
+                            if (
+                                tool_event
+                                and tool_event.get("tool") == "agent_stage_motion"
+                                and tool_event.get("status") == "completed"
+                            ):
+                                tool_call_id = tool_event.get("toolCallId")
+                                if tool_call_id:
+                                    motion_tool_call_ids.add(str(tool_call_id))
+                            continue
+
+                        if event_data == "[DONE]":
+                            break
+
+                        chunk = self._parse_json_object(event_data)
+                        if not chunk:
+                            continue
+                        for text in self._extract_delta_texts(chunk):
+                            yield LLMResponse(context_id=context_id, text=text)
+
+        except httpx.HTTPStatusError as hserr:
+            response_json = None
+            try:
+                response_json = hserr.response.json()
+            except Exception:
+                pass
+            logger.warning(f"HTTPStatusError from Hermes SSE bridge: {hserr}")
+            yield LLMResponse(context_id=context_id, error_info={"exception": hserr, "response_json": response_json})
+            return
+        except Exception as ex:
+            logger.warning(f"Error from Hermes SSE bridge: {ex}")
+            yield LLMResponse(context_id=context_id, error_info={"exception": ex, "response_json": None})
+            return
+
+        if motion_tool_call_ids:
+            motion_events = []
+            for attempt in range(3):
+                motion_events = await self._fetch_hermes_motion_tool_results(
+                    chat_completion_params,
+                    motion_tool_call_ids,
+                )
+                if motion_events:
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(0.25)
+            for event in motion_events:
+                tool_call = ToolCall(
+                    id=event.get("tool_call_id") or event.get("id") or "agent_stage_motion",
+                    name="agent_stage_motion",
+                    arguments=event.get("arguments") or "",
+                    result=ToolCallResult(data=event),
+                )
+                yield LLMResponse(
+                    context_id=context_id,
+                    tool_call=tool_call,
+                    structured_content=event,
+                )
+
+    async def _iter_sse_events(self, response: httpx.Response) -> AsyncGenerator[tuple[str, str], None]:
+        event_name = "message"
+        data_lines = []
+        async for raw_line in response.aiter_lines():
+            line = raw_line.rstrip("\r")
+            if not line:
+                if data_lines:
+                    yield event_name, "\n".join(data_lines)
+                event_name = "message"
+                data_lines = []
+                continue
+            if line.startswith(":"):
+                continue
+            if line.startswith("event:"):
+                event_name = line[len("event:"):].strip() or "message"
+            elif line.startswith("data:"):
+                data_lines.append(line[len("data:"):].strip())
+        if data_lines:
+            yield event_name, "\n".join(data_lines)
+
+    def _parse_json_object(self, text: str) -> Optional[Dict[str, Any]]:
+        try:
+            value = json.loads(text)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def _extract_delta_texts(self, chunk: Dict[str, Any]) -> List[str]:
+        texts = []
+        for choice in chunk.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta") or {}
+            if not isinstance(delta, dict):
+                continue
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                texts.append(content)
+        return texts
+
+    async def _fetch_hermes_motion_tool_results(
+        self,
+        chat_completion_params: Dict[str, Any],
+        tool_call_ids: set[str],
+    ) -> List[Dict[str, Any]]:
+        session_id = self._hermes_session_id(chat_completion_params)
+        api_origin = self._api_origin_url()
+        if not session_id or not api_origin:
+            return []
+
+        url = f"{api_origin}/api/sessions/{session_id}/messages"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(url, headers=self._request_headers(chat_completion_params))
+                response.raise_for_status()
+                payload = response.json()
+        except Exception as exc:
+            logger.warning("Failed to fetch Hermes session messages for motion metadata: %s", exc)
+            return []
+
+        messages = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(messages, list):
+            return []
+
+        results = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") != "tool" or message.get("tool_name") != "agent_stage_motion":
+                continue
+            tool_call_id = str(message.get("tool_call_id") or "")
+            if tool_call_id and tool_call_id not in tool_call_ids:
+                continue
+            content = message.get("content")
+            tool_result = self._parse_json_object(content)
+            if not tool_result:
+                continue
+            motion = self._extract_motion_metadata(tool_result)
+            if not motion:
+                continue
+            event = dict(tool_result)
+            event["tool_call_id"] = tool_call_id
+            event.setdefault("metadata", {})["motion"] = motion
+            results.append(event)
+        return results
+
+    def _extract_motion_metadata(self, tool_result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        metadata = tool_result.get("metadata")
+        if isinstance(metadata, dict) and isinstance(metadata.get("motion"), dict):
+            return metadata["motion"]
+        motion = tool_result.get("motion")
+        if isinstance(motion, dict):
+            return motion
+        return None

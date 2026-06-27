@@ -428,6 +428,9 @@ class AIAvatarWebSocketServer(Adapter):
 
         elif response.type == "tool_call":
             aiavatar_response.metadata["tool_call"] = response.tool_call.to_dict()
+            motion = self._extract_motion_metadata(response)
+            if motion:
+                aiavatar_response.metadata["motion"] = motion
 
         elif response.type == "final":
             vision_source = self.parse_vision_source(response.text)
@@ -439,6 +442,26 @@ class AIAvatarWebSocketServer(Adapter):
             await self.stop_response(response)
 
         await self.send_response(aiavatar_response)
+
+    def _extract_motion_metadata(self, response: STSResponse) -> Optional[dict]:
+        if isinstance(response.structured_content, dict):
+            metadata = response.structured_content.get("metadata")
+            if isinstance(metadata, dict) and isinstance(metadata.get("motion"), dict):
+                return metadata["motion"]
+            motion = response.structured_content.get("motion")
+            if isinstance(motion, dict):
+                return motion
+
+        tool_call = response.tool_call
+        if tool_call and tool_call.result and isinstance(tool_call.result.data, dict):
+            metadata = tool_call.result.data.get("metadata")
+            if isinstance(metadata, dict) and isinstance(metadata.get("motion"), dict):
+                return metadata["motion"]
+            motion = tool_call.result.data.get("motion")
+            if isinstance(motion, dict):
+                return motion
+
+        return None
 
     async def stop_response(self, session_id: str, context_id: str):
         # Send stop message to client
